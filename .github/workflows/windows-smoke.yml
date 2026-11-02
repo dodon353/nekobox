@@ -1,0 +1,99 @@
+name: Verify Windows Xray URL tests and package
+'on':
+  push:
+    branches:
+      - codex/windows10-smoke-*
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  launch:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Wait for the Windows compatibility package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch 41435696080 --repo dodon353/nekobox --exit-status --interval 30
+      - name: Download compiled Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: NekoBox-Windows10-x64-experimental
+          path: packages
+          run-id: 41435696080
+          github-token: ${{ github.token }}
+      - name: Check packaged executables and GUI startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archives = @(Get-ChildItem packages -Recurse -File -Filter '*windows64.zip')
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows x64 portable ZIP' }
+          $target = Join-Path $env:RUNNER_TEMP 'nekobox-launch-check'
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $target
+          $applications = @(Get-ChildItem $target -Recurse -File -Filter 'nekobox.exe')
+          if ($applications.Count -ne 1) { throw 'Expected exactly one packaged GUI executable' }
+          $application = $applications[0]
+          $directory = $application.DirectoryName
+          $xray = Join-Path $directory 'xray.exe'
+          $core = Join-Path $directory 'nekobox_core.exe'
+          foreach ($path in @($xray, $core)) {
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing packaged executable: $path" }
+          }
+          $xrayVersion = (& $xray version | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $xrayVersion -notmatch 'Xray 26\.10\.31\s') { throw "Unexpected Xray executable: $xrayVersion" }
+          Write-Host $xrayVersion
+          & $core sing-box version
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged sing-box core cannot start' }
+          $env:NEKOBOX_LOG_FILE = Join-Path $env:RUNNER_TEMP 'nekobox-startup.log'
+          $process = Start-Process -FilePath $application.FullName -WorkingDirectory $directory -PassThru
+          try {
+            Start-Sleep -Seconds 12
+            $process.Refresh()
+            if ($process.HasExited) { throw "GUI exited during startup, code $($process.ExitCode)" }
+            Write-Host "PASS: GUI remains running; PID $($process.Id); title $($process.MainWindowTitle)"
+            Write-Host "GUI file version: $($application.VersionInfo.FileVersion)"
+            $coreProcesses = @(Get-Process -Name nekobox_core -ErrorAction SilentlyContinue)
+            if ($coreProcesses.Count -eq 0) { throw 'No core process after GUI startup' }
+            Write-Host 'PASS: GUI started its core process'
+          } finally {
+            $process.Refresh()
+            if (!$process.HasExited) {
+              $null = $process.CloseMainWindow()
+              if (!$process.WaitForExit(5000)) { Stop-Process -Id $process.Id -Force }
+            }
+            if (Test-Path -LiteralPath $env:NEKOBOX_LOG_FILE) {
+              Get-Content -LiteralPath $env:NEKOBOX_LOG_FILE -Tail 100
+            }
+          }
+  native-url-test:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install the same Qt as the application
+        uses: qr243vbi/qt6windows7@main
+        with:
+          version: 6.10.0_x86_64
+      - name: Compile production URL tester with MSVC
+        shell: pwsh
+        run: |
+          cmake -S tests/xray-url-test -B urltest-build "-DCMAKE_PREFIX_PATH=$env:QT6_DIR"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build urltest-build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test a real VLESS XHTTP TLS connection on Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          source script/xray_release.sh
+          runtime="$RUNNER_TEMP/nekobox-native-url-check"
+          mkdir -p "$runtime"
+          curl -fLsS --retry 3 -o "$runtime/Xray-windows-64.zip" "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-windows-64.zip"
+          xray_verify_archive "$runtime/Xray-windows-64.zip" Xray-windows-64.zip
+          unzip -q "$runtime/Xray-windows-64.zip" xray.exe -d "$runtime"
+          python tests/xray-url-test/test_url_test.py --binary "$(cygpath -m "$PWD/urltest-build/Release/xray-url-test.exe")" --xray "$(cygpath -m "$runtime/xray.exe")"
