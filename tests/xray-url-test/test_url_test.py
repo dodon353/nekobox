@@ -44,13 +44,14 @@ def port():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--xray', type=Path, required=True)
+    parser.add_argument('--binary', type=Path, help='Use an already compiled tester (Windows smoke test)')
     args = parser.parse_args()
     xray = str(args.xray.resolve())
-    flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'Qt6Core', 'Qt6Network'], text=True))
+    flags = [] if args.binary else shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'Qt6Core', 'Qt6Network'], text=True))
     with tempfile.TemporaryDirectory(prefix='nekobox-url-regression-') as directory:
         root = Path(directory)
-        binary = root / 'url-test'
-        subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-fPIC', '-pthread',
+        binary = args.binary.resolve() if args.binary else root / 'url-test'
+        if not args.binary: subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-fPIC', '-pthread',
                         '-I' + str(REPO / 'src'), str(REPO / 'tests/xray-url-test/main.cpp'),
                         str(REPO / 'src/gharqad/sys/XrayURLTest.cpp'), '-o', str(binary), *flags], check=True)
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -85,6 +86,7 @@ echo "$5" > {shlex.quote(str(root/'child.config'))}
 exec {shlex.quote(xray)} "$@"
 ''')
         wrapper.chmod(0o700)
+        test_program = str(wrapper) if os.name == 'posix' else xray
         server_file = root/'server.json'
         server_file.write_text(json.dumps(server))
         with (root/'server.log').open('w') as log:
@@ -101,7 +103,7 @@ exec {shlex.quote(xray)} "$@"
                 with socket.socket() as active:
                     active.bind(('127.0.0.1', 0)); active.listen()
                     client['inbounds'][0]['port'] = active.getsockname()[1]
-                    def run(path='/ok', timeout=4000, cancel=-1, program=str(wrapper), config=client):
+                    def run(path='/ok', timeout=4000, cancel=-1, program=test_program, config=client):
                         for record in ('child.pid', 'child.config'):
                             (root/record).unlink(missing_ok=True)
                         file = root/'client.json'; file.write_text(json.dumps(config))
