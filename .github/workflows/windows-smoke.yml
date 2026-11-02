@@ -1,0 +1,77 @@
+name: Verify packaged NekoBox interface and connection
+'on':
+  push:
+    branches:
+      - codex/windows10-smoke-*
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  launch:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for the final Windows compatibility package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch 41470176978 --repo dodon353/nekobox --exit-status --interval 30
+      - name: Download compiled Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: NekoBox-Windows10-x64-experimental
+          path: packages
+          run-id: 41470176978
+          github-token: ${{ github.token }}
+      - name: Check packaged executables and GUI startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archives = @(Get-ChildItem packages -Recurse -File -Filter '*windows64.zip')
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows x64 portable ZIP' }
+          $target = Join-Path $env:RUNNER_TEMP 'nekobox-launch-check'
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $target
+          $applications = @(Get-ChildItem $target -Recurse -File -Filter 'nekobox.exe')
+          if ($applications.Count -ne 1) { throw 'Expected exactly one packaged GUI executable' }
+          $application = $applications[0]
+          $directory = $application.DirectoryName
+          $xray = Join-Path $directory 'xray.exe'
+          $core = Join-Path $directory 'nekobox_core.exe'
+          foreach ($path in @($xray, $core)) {
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing packaged executable: $path" }
+          }
+          $xrayVersion = (& $xray version | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $xrayVersion -notmatch 'Xray 26\.10\.31\s') { throw "Unexpected Xray executable: $xrayVersion" }
+          Write-Host $xrayVersion
+          & $core sing-box version
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged sing-box core cannot start' }
+          $env:NEKOBOX_LOG_FILE = Join-Path $env:RUNNER_TEMP 'nekobox-startup.log'
+          $process = Start-Process -FilePath $application.FullName -WorkingDirectory $directory -PassThru
+          try {
+            Start-Sleep -Seconds 12
+            $process.Refresh()
+            if ($process.HasExited) { throw "GUI exited during startup, code $($process.ExitCode)" }
+            Write-Host "PASS: GUI remains running; PID $($process.Id); title $($process.MainWindowTitle)"
+            Write-Host "GUI file version: $($application.VersionInfo.FileVersion)"
+            if ($process.MainWindowTitle -notmatch 'NekoBox 5\.11\.28\.7') { throw 'Incorrect GUI branding or version' }
+            if ($application.VersionInfo.FileVersion -ne '5.11.28.7') { throw 'Incorrect EXE file version' }
+            if ($application.VersionInfo.ProductName -ne 'NekoBox') { throw 'Incorrect EXE product name' }
+            Write-Host 'PASS: NekoBox title, product name and executable version'
+            $coreProcesses = @(Get-Process -Name nekobox_core -ErrorAction SilentlyContinue)
+            if ($coreProcesses.Count -eq 0) { throw 'No core process after GUI startup' }
+            Write-Host 'PASS: GUI started its core process'
+          } finally {
+            $process.Refresh()
+            if (!$process.HasExited) {
+              $null = $process.CloseMainWindow()
+              if (!$process.WaitForExit(5000)) { Stop-Process -Id $process.Id -Force }
+            }
+            if (Test-Path -LiteralPath $env:NEKOBOX_LOG_FILE) {
+              Get-Content -LiteralPath $env:NEKOBOX_LOG_FILE -Tail 100
+            }
+          }
+          Write-Host 'Testing the core extracted from the actual portable ZIP'
+          & python tests/external-core-start/test_core_start.py --core $core --xray $xray
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged core normal Xray startup regression failed' }
